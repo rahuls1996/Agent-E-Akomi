@@ -5,12 +5,15 @@ from typing import Any
 
 import autogen  # type: ignore
 from autogen import ConversableAgent  # type: ignore
+from autogen.agentchat.contrib.multimodal_conversable_agent import MultimodalConversableAgent
+
 
 from ae.core.memory.static_ltm import get_user_ltm
 from ae.core.post_process_responses import final_reply_callback_planner_agent as print_message_as_planner  # type: ignore
 from ae.core.prompts import LLM_PROMPTS
 from ae.core.skills.get_user_input import get_user_input
 from ae.utils.logger import logger
+from ae.core.agents.enhanced_assistant import EnhancedAssistantAgent
 
 
 class PlannerAgent:
@@ -44,7 +47,7 @@ class PlannerAgent:
         system_message = system_message + "\n" + f"Today's date is {datetime.now().strftime('%d %B %Y')}"
         logger.info(f"Planner agent using model: {model_config_list[0]['model']}")
 
-        self.agent = autogen.AssistantAgent(
+        self.agent = EnhancedAssistantAgent(
             name="planner_agent",
             system_message=system_message,
             llm_config={
