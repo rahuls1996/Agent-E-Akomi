@@ -15,7 +15,7 @@ from ae.utils.ui_messagetype import MessageType
 
 
 async def click(selector: Annotated[str, "The properly formed query selector string to identify the element for the click action (e.g. [mmid='114']). When \"mmid\" attribute is present, use it for the query selector."],
-                wait_before_execution: Annotated[float, "Optional wait time in seconds before executing the click event logic.", float] = 0.0) -> Annotated[str, "A message indicating success or failure of the click."]:
+                wait_before_execution: Annotated[float, "Optional wait time in seconds before executing the click event logic.", float] = 3.0) -> Annotated[str, "A message indicating success or failure of the click."]:
     """
     Executes a click action on the element matching the given query selector string within the currently open web page.
     If there is no page open, it will raise a ValueError. An optional wait time can be specified before executing the click logic. Use this to wait for the page to load especially when the last action caused the DOM/Page to load.
@@ -120,8 +120,8 @@ async def do_click(page: Page, selector: str, wait_before_execution: float) -> d
 
 
         #Playwright click seems to fail more often than not, disabling it for now and just going with JS click
-        #await perform_playwright_click(element, selector)
-        msg = await perform_javascript_click(page, selector)
+        await perform_playwright_click(element, selector)
+        #msg = await perform_javascript_click(page, selector)
         return {"summary_message": msg, "detailed_message": f"{msg} The clicked element's outer HTML is: {element_outer_html}."} # type: ignore
     except Exception as e:
         logger.error(f"Unable to click element with selector: \"{selector}\". Error: {e}")
@@ -156,8 +156,13 @@ async def perform_playwright_click(element: ElementHandle, selector: str):
     Returns:
     - None
     """
-    logger.info(f"Performing first Step: Playwright Click on element with selector: {selector}")
-    await element.click(force=False, timeout=200)
+    logger.info(f"Performing Playwright Click on element with selector: {selector}")
+    try:
+        await element.click(timeout=5000)
+        logger.info(f"Successfully clicked element with selector: {selector}")
+    except Exception as e:
+        logger.error(f"Error clicking element with selector: {selector}. Error: {e}")
+        traceback.print_exc()
 
 
 async def perform_javascript_click(page: Page, selector: str):
@@ -187,7 +192,7 @@ async def perform_javascript_click(page: Page, selector: str):
             // Trigger change event if necessary
             let event = new Event('change', { bubbles: true });
             parent.dispatchEvent(event);
-
+            console.log("Chicken Tikka Masala")
             console.log("Select menu option", value, "selected");
             return "Select menu option: "+ value+ " selected";
         }
