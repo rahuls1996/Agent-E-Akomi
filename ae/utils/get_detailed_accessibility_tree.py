@@ -11,7 +11,7 @@ from ae.config import SOURCE_LOG_FOLDER_PATH
 from ae.core.playwright_manager import PlaywrightManager
 from ae.utils.logger import logger
 
-space_delimited_mmid = re.compile(r'^[\d ]+$')
+space_delimited_mmid: re.Pattern[str] = re.compile(r'^[\d ]+$')
 
 def is_space_delimited_mmid(s: str) -> bool:
     """
@@ -29,12 +29,9 @@ def is_space_delimited_mmid(s: str) -> bool:
 
 async def __inject_attributes(page: Page):
     """
-    Injects 'mmid' and 'aria-keyshortcuts' into all DOM elements. If an element already has an 'aria-keyshortcuts',
-    it renames it to 'orig-aria-keyshortcuts' before injecting the new 'aria-keyshortcuts'
-    This will be captured in the accessibility tree and thus make it easier to reconcile the tree with the DOM.
-    'aria-keyshortcuts' is choosen because it is not widely used aria attribute.
+    Injects 'mmid' and 'aria-keyshortcuts' into all DOM elements, including dynamically loaded ones.
     """
-
+    # First, inject attributes into existing elements
     last_mmid = await page.evaluate("""() => {
         const allElements = document.querySelectorAll('*');
         let id = 0;
@@ -43,7 +40,6 @@ async def __inject_attributes(page: Page):
             const mmid = `${++id}`;
             element.setAttribute('mmid', mmid);
             element.setAttribute('aria-keyshortcuts', mmid);
-            //console.log(`Injected 'mmid'into element with tag: ${element.tagName} and mmid: ${mmid}`);
             if (origAriaAttribute) {
                 element.setAttribute('orig-aria-keyshortcuts', origAriaAttribute);
             }
@@ -53,54 +49,45 @@ async def __inject_attributes(page: Page):
     logger.debug(f"Added MMID into {last_mmid} elements")
 
 
-async def __fetch_dom_info(page: Page, accessibility_tree: dict[str, Any], only_input_fields: bool):
-    """
-    Iterates over the accessibility tree, fetching additional information from the DOM based on 'mmid',
-    and constructs a new JSON structure with detailed information.
-
-    Args:
-        page (Page): The page object representing the web page.
-        accessibility_tree (dict[str, Any]): The accessibility tree JSON structure.
-        only_input_fields (bool): Flag indicating whether to include only input fields in the new JSON structure.
-
-    Returns:
-        dict[str, Any]: The pruned tree with detailed information from the DOM.
-    """
-
-    logger.debug("Reconciling the Accessibility Tree with the DOM")
+async def __fetch_dom_info(page, accessibility_tree, only_input_fields: bool):
     # Define the attributes to fetch for each element
     attributes = ['name', 'aria-label', 'placeholder', 'mmid', "id", "for", "data-testid"]
-    backup_attributes = [] #if the attributes are not found, then try to get these attributes
-    tags_to_ignore = ['head','style', 'script', 'link', 'meta', 'noscript', 'template', 'iframe', 'g', 'main', 'c-wiz','svg', 'path']
+    backup_attributes = []  # If the attributes are not found, then try to get these attributes
+    tags_to_ignore = ['head', 'style', 'script', 'link', 'meta', 'noscript', 'template', 'iframe', 'g', 'main', 'c-wiz', 'svg', 'path']
     attributes_to_delete = ["level", "multiline", "haspopup", "id", "for"]
     ids_to_ignore = ['agentDriveAutoOverlay']
 
     # Recursive function to process each node in the accessibility tree
-    async def process_node(node: dict[str, Any]):
+    async def process_node(node):
         if 'children' in node:
             for child in node['children']:
                 await process_node(child)
 
-        # Use 'name' attribute from the accessibility node as 'mmid'
-        mmid_temp: str = node.get('keyshortcuts') # type: ignore
+        mmid_temp = node.get('keyshortcuts') or node.get('description')
 
-        # If the name has multiple mmids, take the last one
-        if(mmid_temp and is_space_delimited_mmid(mmid_temp)):
-            #TODO: consider if we should grab each of the mmids and process them separately as seperate nodes copying this node's attributes
+        if mmid_temp and is_space_delimited_mmid(mmid_temp):
+            mmid_temp = mmid_temp.split(' ')[-1]
+        else:
+            mmid_temp = None
+
+        if not mmid_temp and node.get('name'):
+            # Attempt to find the mmid by querying the DOM
+            mmid_temp = await page.evaluate('''(text) => {
+                const elements = Array.from(document.querySelectorAll('li[mmid], span[mmid], div[mmid]'));
+                const element = elements.find(el => el.textContent.trim() === text);
+                return element ? element.getAttribute('mmid') : null;
+            }''', node['name'])
+
+        if mmid_temp and is_space_delimited_mmid(mmid_temp):
             mmid_temp = mmid_temp.split(' ')[-1]
 
-        #focusing on nodes with mmid, which is the attribute we inject
         try:
             mmid = int(mmid_temp)
         except (ValueError, TypeError):
-            #logger.error(f"'name attribute contains \"{node.get('name')}\", which is not a valid numeric mmid. Adding node as is: {node}")
-            return node.get('name')
-
-        if node['role'] == 'menuitem':
-            return node.get('name')
+            return  # Skip processing this node if mmid is not found
 
         if node.get('role') == 'dialog' and node.get('modal') == True:  # noqa: E712
-            node["important information"] = "This is a modal dialog. Please interact with this dialog and close it to be able to interact with the full page (e.g. by pressing the close button or selecting an option)."
+            node["important information"] = "This is a modal dialog. Please interact with this dialog and close it to be able to interact with the full page (e.g., by pressing the close button or selecting an option)."
 
         if mmid:
             # Determine if we need to fetch 'innerText' based on the absence of 'children' in the accessibility node
@@ -125,43 +112,22 @@ async def __fetch_dom_info(page: Page, accessibility_tree: dict[str, Any], only_
                     console.log(`Ignoring element with id: ${element.id}`, element);
                     return null;
                 }
-                //Ignore "option" because it would have been processed with the select element
+
                 if (tags_to_ignore.includes(element.tagName.toLowerCase()) || element.tagName.toLowerCase() === "option") return null;
 
                 let attributes_to_values = {
-                    'tag': element.tagName.toLowerCase() // Always include the tag name
+                    'tag': element.tagName.toLowerCase(),
+                    'mmid': mmid
                 };
 
-                // If the element is an input, include its type as well
                 if (element.tagName.toLowerCase() === 'input') {
-                    attributes_to_values['tag_type'] = element.type; // This will capture 'checkbox', 'radio', etc.
-                }
-                else if (element.tagName.toLowerCase() === 'select') {
-                    attributes_to_values["mmid"] = element.getAttribute('mmid');
-                    attributes_to_values["role"] = "combobox";
-                    attributes_to_values["options"] = [];
-
-                    for (const option of element.options) {
-                        let option_attributes_to_values = {
-                            "mmid": option.getAttribute('mmid'),
-                            "text": option.text,
-                            "value": option.value,
-                            "selected": option.selected
-                        };
-                        attributes_to_values["options"].push(option_attributes_to_values);
-                    }
-                    return attributes_to_values;
+                    attributes_to_values['tag_type'] = element.type;
                 }
 
                 for (const attribute of attributes) {
                     let value = element.getAttribute(attribute);
 
-                    if(value){
-                        /*
-                        if(attribute === 'href'){
-                            value = value.split('?')[0]
-                        }
-                        */
+                    if (value) {
                         attributes_to_values[attribute] = value;
                     }
                 }
@@ -170,72 +136,6 @@ async def __fetch_dom_info(page: Page, accessibility_tree: dict[str, Any], only_
                     attributes_to_values['description'] = element.innerText;
                 }
 
-                let role = element.getAttribute('role');
-                if(role==='listbox' || element.tagName.toLowerCase()=== 'ul'){
-                    let children=element.children;
-                    let filtered_children = Array.from(children).filter(child => child.getAttribute('role') === 'option');
-                    console.log("Listbox or ul found: ", filtered_children);
-                    let attributes_to_include = ['mmid', 'role', 'aria-label','value'];
-                    attributes_to_values["additional_info"]=[]
-                    for (const child of children) {
-                        let children_attributes_to_values = {};
-
-                        for (let attr of child.attributes) {
-                            // If the attribute is not in the predefined list, add it to children_attributes_to_values
-                            if (attributes_to_include.includes(attr.name)) {
-                                children_attributes_to_values[attr.name] = attr.value;
-                            }
-                        }
-
-                        attributes_to_values["additional_info"].push(children_attributes_to_values);
-                    }
-                }
-                // Check if attributes_to_values contains more than just 'name', 'role', and 'mmid'
-                const keys = Object.keys(attributes_to_values);
-                const minimalKeys = ['tag', 'mmid'];
-                const hasMoreThanMinimalKeys = keys.length > minimalKeys.length || keys.some(key => !minimalKeys.includes(key));
-
-                if (!hasMoreThanMinimalKeys) {
-                    //If there were no attributes found, then try to get the backup attributes
-                    for (const backupAttribute of input_params.backup_attributes) {
-                        let value = element.getAttribute(backupAttribute);
-                        if(value){
-                            attributes_to_values[backupAttribute] = value;
-                        }
-                    }
-
-                    //if even the backup attributes are not found, then return null, which will cause this element to be skipped
-                    if(Object.keys(attributes_to_values).length <= minimalKeys.length) {
-                        if (element.tagName.toLowerCase() === 'button') {
-                                attributes_to_values["mmid"] = element.getAttribute('mmid');
-                                attributes_to_values["role"] = "button";
-                                attributes_to_values["additional_info"] = [];
-                                let children=element.children;
-                                let attributes_to_exclude = ['width', 'height', 'path', 'class', 'viewBox', 'mmid']
-
-                                // Check if the button has no text and no attributes
-                                if (element.innerText.trim() === '') {
-
-                                    for (const child of children) {
-                                        let children_attributes_to_values = {};
-
-                                        for (let attr of child.attributes) {
-                                            // If the attribute is not in the predefined list, add it to children_attributes_to_values
-                                            if (!attributes_to_exclude.includes(attr.name)) {
-                                                children_attributes_to_values[attr.name] = attr.value;
-                                            }
-                                        }
-
-                                        attributes_to_values["additional_info"].push(children_attributes_to_values);
-                                    }
-                                    console.log("Button with no text and no attributes: ", attributes_to_values);
-                                    return attributes_to_values;
-                                }
-                        }
-
-                        return null; // Return null if only minimal keys are present
-                    }
-                }
                 return attributes_to_values;
             }
             """
@@ -248,38 +148,36 @@ async def __fetch_dom_info(page: Page, accessibility_tree: dict[str, Any], only_
                                                       "ids_to_ignore": ids_to_ignore})
 
             if 'keyshortcuts' in node:
-                    del node['keyshortcuts'] #remove keyshortcuts since it is not needed
+                del node['keyshortcuts']  # Remove keyshortcuts since it is not needed
 
-            node["mmid"]=mmid
+            node["mmid"] = str(mmid)
 
             # Update the node with fetched information
             if element_attributes:
                 node.update(element_attributes)
 
-                # check if 'name' and 'mmid' are the same
+                # Remove redundant or unnecessary attributes
                 if node.get('name') == node.get('mmid') and node.get('role') != "textbox":
                     del node['name']  # Remove 'name' from the node
 
                 if 'name' in node and 'description' in node and (node['name'] == node['description'] or node['name'] == node['description'].replace('\n', ' ') or node['description'].replace('\n', '') in node['name']):
-                    del node['description'] #if the name is same as description, then remove the description to avoid duplication
+                    del node['description']
 
-                if 'name' in node and 'aria-label' in node and  node['aria-label'] in node['name']:
-                    del node['aria-label'] #if the name is same as the aria-label, then remove the aria-label to avoid duplication
+                if 'name' in node and 'aria-label' in node and node['aria-label'] in node['name']:
+                    del node['aria-label']
 
                 if 'name' in node and 'text' in node and node['name'] == node['text']:
-                    del node['text'] #if the name is same as the text, then remove the text to avoid duplication
+                    del node['text']
 
-                if node.get('tag') == "select": #children are not needed for select menus since "options" attriburte is already added
+                if node.get('tag') == "select":
                     node.pop("children", None)
                     node.pop("role", None)
                     node.pop("description", None)
 
-                #role and tag can have the same info. Get rid of role if it is the same as tag
                 if node.get('role') == node.get('tag'):
                     del node['role']
 
-                # avoid duplicate aria-label
-                if node.get("aria-label") and node.get("placeholder") and node.get("aria-label") == node.get("placeholder"):
+                if node.get("aria-label") and node.get("placeholder") and node["aria-label"] == node["placeholder"]:
                     del node["aria-label"]
 
                 if node.get("role") == "link":
@@ -288,45 +186,16 @@ async def __fetch_dom_info(page: Page, accessibility_tree: dict[str, Any], only_
                         node["text"] = node["description"]
                         del node["description"]
 
-                #textbox just means a text input and that is expressed well enough with the rest of the attributes returned
-                #if node.get('role') == "textbox":
-                #    del node['role']
+                for attribute_to_delete in attributes_to_delete:
+                    if attribute_to_delete in node:
+                        node.pop(attribute_to_delete, None)
+            else:
+                node["marked_for_deletion_by_mm"] = True  # Mark node for deletion if attributes are not found
 
-                if node.get('role') == "textbox":
-                    #get the id attribute of this field from the DOM
-                    if "id" in element_attributes and element_attributes["id"]:
-                        #find if there is an element in the DOM that has this id in aria-labelledby.
-                        js_code = """
-                        (inputParams) => {
-                            let referencingElements = [];
-                            const referencedElement = document.querySelector(`[aria-labelledby="${inputParams.aria_labelled_by_query_value}"]`);
-                            if(referencedElement) {
-                                const mmid = referencedElement.getAttribute('mmid');
-                                if (mmid) {
-                                    return {"mmid": mmid, "tag": referencedElement.tagName.toLowerCase()};
-                                }
-                            }
-                            return null;
-                        }
-                        """
-                    #textbox just means a text input and that is expressed well enough with the rest of the attributes returned
-                    #del node['role']
-
-            #remove attributes that are not needed once processing of a node is complete
-            for attribute_to_delete in attributes_to_delete:
-                if attribute_to_delete in node:
-                    node.pop(attribute_to_delete, None)
-        else:
-            logger.debug(f"No element found with mmid: {mmid}, deleting node: {node}")
-            node["marked_for_deletion_by_mm"] = True
-
-
-    # Process each node in the tree starting from the root
     await process_node(accessibility_tree)
 
     pruned_tree = __prune_tree(accessibility_tree, only_input_fields)
 
-    logger.debug("Reconciliation complete")
     return pruned_tree
 
 
